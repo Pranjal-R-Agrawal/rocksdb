@@ -364,9 +364,7 @@ TEST_F(CuckooReaderTest, WhenKeyNotFound) {
   ASSERT_OK(reader.status());
 
   // Test read when key is unused key.
-  std::string unused_key =
-      reader.GetTableProperties()->user_collected_properties.at(
-          CuckooTablePropertyNames::kEmptyKey);
+  std::string unused_key = InternalKey(" ", 0, kTypeValue).Encode().ToString();
   // Add hash values that map to empty buckets.
   AddHashLookups(ExtractUserKey(unused_key).ToString(), kNumHashFunc,
                  kNumHashFunc);

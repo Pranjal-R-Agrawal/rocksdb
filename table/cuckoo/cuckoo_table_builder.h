@@ -85,6 +85,13 @@ class CuckooTableBuilder : public TableBuilder {
     // We assume number of items is <= 2^32.
     uint32_t make_space_for_key_call_id;
   };
+
+  struct KVOffset {
+    uint32_t kv_idx;
+    uint32_t key_len;
+    uint32_t value_len;
+  };
+
   static const uint32_t kMaxVectorIdx = std::numeric_limits<int32_t>::max();
 
   bool MakeSpaceForKey(const autovector<uint64_t>& hash_vals,
@@ -92,7 +99,6 @@ class CuckooTableBuilder : public TableBuilder {
                        std::vector<CuckooBucket>* buckets, uint64_t* bucket_id);
   Status MakeHashTable(std::vector<CuckooBucket>* buckets);
 
-  inline bool IsDeletedKey(uint64_t idx) const;
   inline Slice GetKey(uint64_t idx) const;
   inline Slice GetUserKey(uint64_t idx) const;
   inline Slice GetValue(uint64_t idx) const;
@@ -106,14 +112,12 @@ class CuckooTableBuilder : public TableBuilder {
   uint64_t hash_table_size_;
   bool is_last_level_file_;
   bool has_seen_first_key_;
-  bool has_seen_first_value_;
-  uint64_t key_size_;
-  uint64_t value_size_;
   // A list of fixed-size key-value pairs concatenating into a string.
   // Use GetKey(), GetUserKey(), and GetValue() to retrieve a specific
   // key / value given an index
   std::string kvs_;
   std::string deleted_keys_;
+  std::vector<KVOffset> kv_offsets_;
   // Number of key-value pairs stored in kvs_ + number of deleted keys
   uint64_t num_entries_;
   // Number of keys that contain value (non-deletion op)
@@ -126,8 +130,6 @@ class CuckooTableBuilder : public TableBuilder {
   bool identity_as_first_hash_;
   uint64_t (*get_slice_hash_)(const Slice& s, uint32_t index,
                               uint64_t max_num_buckets);
-  std::string largest_user_key_ = "";
-  std::string smallest_user_key_ = "";
 
   bool closed_;  // Either Finish() or Abandon() has been called.
 };

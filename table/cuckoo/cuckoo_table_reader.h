@@ -73,6 +73,8 @@ class CuckooTableReader : public TableReader {
   void SetupForCompaction() override {}
   // End of methods not implemented.
 
+  bool IsLastLevel() const { return is_last_level_; }
+
  private:
   friend class CuckooTableIterator;
   void LoadAllKeys(std::vector<std::pair<Slice, uint32_t>>* key_to_bucket_id);
@@ -92,7 +94,9 @@ class CuckooTableReader : public TableReader {
   uint32_t cuckoo_block_size_;
   uint32_t cuckoo_block_bytes_minus_one_;
   uint64_t table_size_;
+  uint64_t kv_data_offset_;
   const Comparator* ucomp_;
+  const InternalKeyComparator* icomp_;
   uint64_t (*get_slice_hash_)(const Slice& s, uint32_t index,
                               uint64_t max_num_buckets);
 };

@@ -9,6 +9,7 @@
 
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
+#include "util/coding_lean.h"
 #include "util/murmurhash.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -30,6 +31,7 @@ static inline uint64_t CuckooHash(
 
   uint64_t value = 0;
   if (hash_cnt == 0 && identity_as_first_hash) {
+    // TODO: Fix Endianness
     value = (*reinterpret_cast<const int64_t*>(user_key.data()));
   } else {
     value = MurmurHash(user_key.data(), static_cast<int>(user_key.size()),
@@ -41,6 +43,42 @@ static inline uint64_t CuckooHash(
     return value & (table_size_ - 1);
   }
 }
+
+static inline uint64_t CuckooFingerPrint(
+    const Slice& user_key, const uint32_t num_max_hashes,
+    const uint64_t num_hashes=5) {
+  uint64_t fingerprint = 0;
+  for (uint32_t i = 0, hash_cnt = num_max_hashes; i < num_hashes;
+       ++i, ++hash_cnt) {
+    const uint64_t hash = MurmurHash(user_key.data(),
+                                     static_cast<int>(user_key.size()),
+                                     kCuckooMurmurSeedMultiplier * hash_cnt);
+    fingerprint ^= (hash << (i * (sizeof(uint64_t) * 8 / (num_hashes))));
+  }
+  return fingerprint;
+}
+
+class CuckooTableBucket {
+public:
+  uint64_t fingerprint = ~0;
+  uint32_t address = ~0;
+
+  void encode(char dst[]) const {
+    EncodeFixed64(dst, fingerprint);
+    EncodeFixed32(dst + sizeof(fingerprint), address);
+  }
+
+  static CuckooTableBucket decode(const char src[]) {
+    return {
+      .fingerprint = DecodeFixed64(src),
+      .address = DecodeFixed32(src + sizeof(fingerprint))
+    };
+  }
+
+  constexpr static size_t size() {
+    return sizeof(fingerprint) + sizeof(address);
+  }
+};
 
 // Cuckoo Table is designed for applications that require fast point lookups
 // but not fast range scans.
