@@ -1,4 +1,4 @@
-add_executable(db_stress${ARTIFACT_SUFFIX}
+set(DB_STRESS_SOURCES
   batched_ops_stress.cc
   cf_consistency_stress.cc
   db_stress.cc
@@ -17,5 +17,12 @@ add_executable(db_stress${ARTIFACT_SUFFIX}
   expected_value.cc
   multi_ops_txns_stress.cc
   no_batched_ops_stress.cc)
+
+add_executable(db_stress${ARTIFACT_SUFFIX} ${DB_STRESS_SOURCES})
 target_link_libraries(db_stress${ARTIFACT_SUFFIX} ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+
+add_library(rocksdb_stress${ARTIFACT_SUFFIX} STATIC ${DB_STRESS_SOURCES})
+target_link_libraries(rocksdb_stress${ARTIFACT_SUFFIX} ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+
 list(APPEND tool_deps db_stress)
+list(APPEND tool_deps rocksdb_stress)
