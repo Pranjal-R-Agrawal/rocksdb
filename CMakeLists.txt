@@ -1718,16 +1718,12 @@ if(WITH_CORE_TOOLS OR WITH_TOOLS)
     DEPENDS ${core_tool_deps})
 endif()
 
-if(WITH_TOOLS)
-  add_subdirectory(db_stress_tool)
-  add_custom_target(tools
-    DEPENDS ${tool_deps})
-endif()
+add_subdirectory(db_stress_tool)
+add_custom_target(tools
+  DEPENDS ${tool_deps})
 
-option(WITH_EXAMPLES "build with examples" OFF)
-if(WITH_EXAMPLES)
-  add_subdirectory(examples)
-endif()
+add_subdirectory(examples)
+add_subdirectory(bench)
 
 option(WITH_BENCHMARK "build benchmark tests" OFF)
 if(WITH_BENCHMARK)

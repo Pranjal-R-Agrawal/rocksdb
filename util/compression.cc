@@ -1540,6 +1540,7 @@ class BuiltinDecompressorV2SnappyOnly final : public BuiltinDecompressorV2 {
 
   Status ExtractUncompressedSize(Args& args) override {
     assert(args.compression_type == kSnappyCompression);
+    (void) args;
 #ifdef SNAPPY
     size_t uncompressed_length = 0;
     if (!snappy::GetUncompressedLength(args.compressed_data.data(),
