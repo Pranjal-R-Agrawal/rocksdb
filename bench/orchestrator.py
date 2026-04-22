@@ -75,7 +75,7 @@ def print_progress(done_keys: int, total_keys: int, label: str = ""):
 def main():
     parser = argparse.ArgumentParser(description="Run or plot RocksDB benchmarks")
     parser.add_argument("--csv", type=str, help="Path to existing CSV to skip benchmarking and just plot")
-    parser.add_argument("--duration", type=float, default=1.5, help="Duration in seconds for each read benchmark")
+    parser.add_argument("--duration", type=float, default=0.3, help="Duration in seconds for each read benchmark")
     parser.add_argument("--miss_ratio", type=float, default=0.2, help="Ratio of cache misses (0.0 to 1.0)")
     parser.add_argument("--shuffle", type=str, default="true", help="Shuffle keys before insertion")
     args = parser.parse_args()
@@ -109,7 +109,7 @@ def main():
             12345, 17891, 24567, 33321,
             45678, 61234, 78901, 104729,
             137913, 181337, 238901, 314159,
-            412667, 543219, # 716543, 943717,
+            412667, 543219, 716543, 943717,
         ]
 
         table_modes = ["block", "cuckoo"]

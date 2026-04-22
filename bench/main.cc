@@ -232,25 +232,33 @@ void run_bench(uint64_t num_keys, bool is_cuckoo, const std::string& bench_mode,
   std::string dummy_miss_key = "key_MISS_0000000000";
 
   auto run_read_benchmark = [&](auto next_index_fn) -> double {
-    for (int i = 0; i < 15000; i++) {
-      val.Reset();
+    std::vector<const std::string*> sample_keys;
+    constexpr auto samples = 100000;
+    sample_keys.reserve(samples);
+    for (int i = 0; i < samples; i++) {
       if (miss_ratio > 0.0 && access_rng() < miss_threshold) {
-        db->Get(ro, db->DefaultColumnFamily(), dummy_miss_key, &val);
+        sample_keys.push_back(&dummy_miss_key);
       } else {
-        db->Get(ro, db->DefaultColumnFamily(), keys[next_index_fn()], &val);
+        sample_keys.push_back(&keys[next_index_fn()]);
       }
+    }
+
+    for (int i = 0; i < 30000; i++) {
+      val.Reset();
+      db->Get(ro, db->DefaultColumnFamily(), *sample_keys[i], &val);
     }
 
     const auto start = std::chrono::high_resolution_clock::now();
     uint64_t total_iters = 0;
+    size_t sample_idx = 0;
 
     while (true) {
       for (int i = 0; i < 7500; i++) {
         val.Reset();
-        if (miss_ratio > 0.0 && access_rng() < miss_threshold) {
-          db->Get(ro, db->DefaultColumnFamily(), dummy_miss_key, &val);
-        } else {
-          db->Get(ro, db->DefaultColumnFamily(), keys[next_index_fn()], &val);
+        db->Get(ro, db->DefaultColumnFamily(), *sample_keys[sample_idx], &val);
+        sample_idx++;
+        if (sample_idx >= samples) {
+          sample_idx = 0;
         }
       }
       total_iters += 7500;
