@@ -19,7 +19,7 @@ def build_rocksdb(source_dir: Path, build_dir: Path):
 def build_benchmarker(source_dir: Path, build_dir: Path):
     print("🛠 Compiling benchmark tool...")
     build_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["cmake", "-S", ".", "-B", str(build_dir)], check=True)
+    subprocess.run(["cmake", "-S", str(source_dir), "-B", str(build_dir)], check=True)
     subprocess.run(["cmake", "--build", str(build_dir)], check=True)
 
 def run_exp(bench_path: Path, n, table_mode, bench_mode, d_dist, a_dist):
@@ -61,11 +61,11 @@ def print_progress(done_keys: int, total_keys: int, label: str = ""):
 def main():
     ts = timestamp_tag()
 
-    source_dir = Path(".").resolve().parent
+    source_dir = Path(__file__).resolve().parent.parent
     build_dir = source_dir / "build"
     build_rocksdb(source_dir, build_dir)
 
-    source_dir = Path('.').resolve()
+    source_dir = Path(__file__).resolve().parent
     build_dir = source_dir / "build"
     build_benchmarker(source_dir, build_dir)
 
