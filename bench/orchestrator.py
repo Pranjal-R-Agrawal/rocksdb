@@ -23,9 +23,23 @@ def build_benchmarker(source_dir: Path, build_dir: Path):
     subprocess.run(["cmake", "-S", str(source_dir), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"], check=True)
     subprocess.run(["cmake", "--build", str(build_dir)], check=True)
 
-def run_exp(bench_path: Path, n, table_mode, bench_mode, d_dist, a_dist, duration_sec):
-    cmd = [str(bench_path), str(n), table_mode, bench_mode, d_dist, a_dist, str(duration_sec)]
-    raw = subprocess.check_output(cmd).decode().strip()
+def run_exp(bench_path: Path, n, table_mode, bench_mode, d_dist, a_dist, duration_sec, miss_ratio, shuffle_keys):
+    cmd = [str(bench_path), str(n), table_mode, bench_mode, d_dist, a_dist, str(duration_sec), str(miss_ratio), "true" if shuffle_keys else "false"]
+    try:
+        raw = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode().strip()
+    except subprocess.CalledProcessError as e:
+        print(f"\n  [ERROR] Benchmark failed for N={n} {table_mode}-{bench_mode}: {e.output.decode().strip() if e.output else ''}")
+        return {
+            "Keys": n,
+            "TableMode": table_mode,
+            "BenchMode": bench_mode,
+            "DataDist": d_dist,
+            "AccessPattern": a_dist,
+            "SizeKB": float('nan'),
+            "AvgLatUs": float('nan'),
+            "BuildTimeSec": float('nan'),
+            "Combo": f"Data={d_dist}, Access={a_dist}",
+        }
 
     parts = [p.strip() for p in raw.split(",")]
     if len(parts) != EXPECTED_FIELD_COUNT:
@@ -61,7 +75,9 @@ def print_progress(done_keys: int, total_keys: int, label: str = ""):
 def main():
     parser = argparse.ArgumentParser(description="Run or plot RocksDB benchmarks")
     parser.add_argument("--csv", type=str, help="Path to existing CSV to skip benchmarking and just plot")
-    parser.add_argument("--duration", type=float, default=1.0, help="Duration in seconds for each read benchmark")
+    parser.add_argument("--duration", type=float, default=1.5, help="Duration in seconds for each read benchmark")
+    parser.add_argument("--miss_ratio", type=float, default=0.2, help="Ratio of cache misses (0.0 to 1.0)")
+    parser.add_argument("--shuffle", action="store_true", help="Shuffle keys before insertion")
     args = parser.parse_args()
 
     source_dir = Path(__file__).resolve().parent
@@ -93,7 +109,7 @@ def main():
             12345, 17891, 24567, 33321,
             45678, 61234, 78901, 104729,
             137913, 181337, 238901, 314159,
-            412667, 543219, 716543, 943717,
+            412667, 543219, # 716543, 943717,
         ]
 
         table_modes = ["block", "cuckoo"]
@@ -109,7 +125,9 @@ def main():
             * sum(n_values)
         )
         done_keys = 0
-        raw_results = []
+        csv_path = results_dir / "final_bench_results.csv"
+        if csv_path.exists():
+            csv_path.unlink()
 
         for n in n_values:
             for d_dist in data_dists:
@@ -118,16 +136,15 @@ def main():
                         for bench_mode in bench_modes:
                             label = f"{table_mode} | {bench_mode} | Data:{d_dist} | Access:{a_dist} | N:{n}"
                             print_progress(done_keys, total_keys, label=label)
-                            raw_results.append(
-                                run_exp(bench_path, n, table_mode, bench_mode, d_dist, a_dist, args.duration)
-                            )
+                            
+                            res = run_exp(bench_path, n, table_mode, bench_mode, d_dist, a_dist, args.duration, args.miss_ratio, args.shuffle)
+                            pd.DataFrame([res]).to_csv(csv_path, mode='a', header=not csv_path.exists(), index=False)
+                            
                             done_keys += n
                             print_progress(done_keys, total_keys, label=label)
 
         sys.stdout.write("\n")
-        df = pd.DataFrame(raw_results)
-        csv_path = results_dir / "final_bench_results.csv"
-        df.to_csv(csv_path, index=False)
+        df = pd.read_csv(csv_path)
 
     build_df = df.groupby(["Keys", "TableMode", "BenchMode", "DataDist"]).agg({
         "BuildTimeSec": "mean",

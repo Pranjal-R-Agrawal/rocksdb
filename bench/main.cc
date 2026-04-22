@@ -144,9 +144,17 @@ Options BuildOptions(bool is_cuckoo, const BenchmarkConfig& cfg) {
 void RunLoadAndMaybeCompact(DB* db, uint64_t num_keys,
                             const std::string& bench_mode,
                             const std::vector<std::string>& keys,
-                            const std::vector<std::string>& values) {
+                            const std::vector<std::string>& values,
+                            bool shuffle_keys) {
   WriteOptions wo;
   wo.disableWAL = true;
+
+  std::vector<uint64_t> insert_order(num_keys);
+  std::iota(insert_order.begin(), insert_order.end(), 0);
+  if (shuffle_keys) {
+    std::mt19937_64 shuffle_rng(kSeed ^ 0x66666666ULL);
+    std::ranges::shuffle(insert_order, shuffle_rng);
+  }
 
   const uint64_t flush_chunk_size = std::max<uint64_t>(1, num_keys / 8);
 
@@ -160,7 +168,8 @@ void RunLoadAndMaybeCompact(DB* db, uint64_t num_keys,
           std::min<uint64_t>(end, batch_base + batch_size);
       WriteBatch wb;
       for (uint64_t i = batch_base; i < batch_end; ++i) {
-        wb.Put(keys[i], values[i]);
+        const uint64_t idx = insert_order[i];
+        wb.Put(keys[idx], values[idx]);
       }
       db->Write(wo, &wb);
     }
@@ -177,7 +186,7 @@ void RunLoadAndMaybeCompact(DB* db, uint64_t num_keys,
 
 void run_bench(uint64_t num_keys, bool is_cuckoo, const std::string& bench_mode,
                const std::string& data_dist, const std::string& access_dist,
-               double duration_sec) {
+               double duration_sec, double miss_ratio, bool shuffle_keys) {
   BenchmarkConfig cfg;
   cfg.compact = (bench_mode == "compact");
   cfg.mode_name = bench_mode;
@@ -198,7 +207,8 @@ void run_bench(uint64_t num_keys, bool is_cuckoo, const std::string& bench_mode,
   const auto [keys, values] = GenerateData(num_keys, data_dist);
 
   const auto t0 = std::chrono::high_resolution_clock::now();
-  RunLoadAndMaybeCompact(&*db, num_keys, bench_mode, keys, values);
+  RunLoadAndMaybeCompact(&*db, num_keys, bench_mode, keys, values,
+                         shuffle_keys);
   const auto t1 = std::chrono::high_resolution_clock::now();
   double build_time_sec = std::chrono::duration<double>(t1 - t0).count();
 
@@ -212,21 +222,38 @@ void run_bench(uint64_t num_keys, bool is_cuckoo, const std::string& bench_mode,
   std::uniform_int_distribution<uint64_t> uniform_key_dist(0, num_keys - 1);
   ZipfianGenerator zipf(num_keys, kSeed ^ 0x44444444ULL);
 
+  uint64_t miss_threshold = 0;
+  if (miss_ratio > 0.0) {
+    miss_threshold = static_cast<uint64_t>(
+                         miss_ratio * static_cast<double>(access_rng.max() -
+                                                          access_rng.min())) +
+                     access_rng.min();
+  }
+  std::string dummy_miss_key = "key_MISS_0000000000";
+
   auto run_read_benchmark = [&](auto next_index_fn) -> double {
     for (int i = 0; i < 15000; i++) {
       val.Reset();
-      db->Get(ro, db->DefaultColumnFamily(), keys[next_index_fn()], &val);
+      if (miss_ratio > 0.0 && access_rng() < miss_threshold) {
+        db->Get(ro, db->DefaultColumnFamily(), dummy_miss_key, &val);
+      } else {
+        db->Get(ro, db->DefaultColumnFamily(), keys[next_index_fn()], &val);
+      }
     }
 
     const auto start = std::chrono::high_resolution_clock::now();
     uint64_t total_iters = 0;
 
     while (true) {
-      for (int i = 0; i < 5000; i++) {
+      for (int i = 0; i < 7500; i++) {
         val.Reset();
-        db->Get(ro, db->DefaultColumnFamily(), keys[next_index_fn()], &val);
+        if (miss_ratio > 0.0 && access_rng() < miss_threshold) {
+          db->Get(ro, db->DefaultColumnFamily(), dummy_miss_key, &val);
+        } else {
+          db->Get(ro, db->DefaultColumnFamily(), keys[next_index_fn()], &val);
+        }
       }
-      total_iters += 5000;
+      total_iters += 7500;
 
       const auto now = std::chrono::high_resolution_clock::now();
       if (std::chrono::duration<double>(now - start).count() >= duration_sec) {
@@ -237,11 +264,20 @@ void run_bench(uint64_t num_keys, bool is_cuckoo, const std::string& bench_mode,
     }
   };
 
+  auto run_with_median = [&](auto next_index_fn) -> double {
+    std::vector<double> results;
+    for (int i = 0; i < 3; i++) {
+      results.push_back(run_read_benchmark(next_index_fn));
+    }
+    std::sort(results.begin(), results.end());
+    return results[1];  // Return the median of 3 runs
+  };
+
   double avg = 0.0;
   if (access_dist == "zipf") {
-    avg = run_read_benchmark([&]() { return zipf.next(); });
+    avg = run_with_median([&]() { return zipf.next(); });
   } else {
-    avg = run_read_benchmark([&]() { return uniform_key_dist(access_rng); });
+    avg = run_with_median([&]() { return uniform_key_dist(access_rng); });
   }
 
   uint64_t size_bytes = 0;
@@ -252,7 +288,7 @@ void run_bench(uint64_t num_keys, bool is_cuckoo, const std::string& bench_mode,
 }
 
 int main(const int argc, const char** argv) {
-  if (argc < 7) return 1;
+  if (argc < 9) return 1;
 
   const uint64_t n = std::stoull(argv[1]);
   const bool cuckoo = std::string(argv[2]) == "cuckoo";
@@ -260,7 +296,11 @@ int main(const int argc, const char** argv) {
   const std::string data_dist = argv[4];
   const std::string access_dist = argv[5];
   const double duration_sec = std::stod(argv[6]);
+  const double miss_ratio = std::stod(argv[7]);
+  const bool shuffle_keys =
+      std::string(argv[8]) == "true" || std::string(argv[8]) == "1";
 
-  run_bench(n, cuckoo, bench_mode, data_dist, access_dist, duration_sec);
+  run_bench(n, cuckoo, bench_mode, data_dist, access_dist, duration_sec,
+            miss_ratio, shuffle_keys);
   return 0;
 }
