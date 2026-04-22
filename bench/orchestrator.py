@@ -77,7 +77,7 @@ def main():
     parser.add_argument("--csv", type=str, help="Path to existing CSV to skip benchmarking and just plot")
     parser.add_argument("--duration", type=float, default=1.5, help="Duration in seconds for each read benchmark")
     parser.add_argument("--miss_ratio", type=float, default=0.2, help="Ratio of cache misses (0.0 to 1.0)")
-    parser.add_argument("--shuffle", action="store_true", help="Shuffle keys before insertion")
+    parser.add_argument("--shuffle", type=str, default="true", help="Shuffle keys before insertion")
     args = parser.parse_args()
 
     source_dir = Path(__file__).resolve().parent
