@@ -11,6 +11,7 @@
 
 #include "db/blob/blob_index.h"
 #include "db/version_set.h"
+#include "db/wide/wide_column_serialization.h"
 #include "logging/event_logger.h"
 #include "rocksdb/slice.h"
 #include "table/unique_id_impl.h"
@@ -64,13 +65,8 @@ uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
 Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
                                       SequenceNumber seqno,
                                       ValueType value_type) {
-  if (value_type == kTypeBlobIndex) {
-    BlobIndex blob_index;
-    const Status s = blob_index.DecodeFrom(value);
-    if (!s.ok()) {
-      return s;
-    }
-
+  // Helper: update oldest_blob_file_number from a single BlobIndex.
+  auto update_oldest_blob = [&](const BlobIndex& blob_index) -> Status {
     if (!blob_index.IsInlined() && !blob_index.HasTTL()) {
       if (blob_index.file_number() == kInvalidBlobFileNumber) {
         return Status::Corruption("Invalid blob file number");
@@ -80,6 +76,24 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
           oldest_blob_file_number > blob_index.file_number()) {
         oldest_blob_file_number = blob_index.file_number();
       }
+    }
+    return Status::OK();
+  };
+
+  if (value_type == kTypeBlobIndex) {
+    BlobIndex blob_index;
+    if (Status s = blob_index.DecodeFrom(value); !s.ok()) {
+      return s;
+    }
+
+    if (Status s = update_oldest_blob(blob_index); !s.ok()) {
+      return s;
+    }
+  } else if (value_type == kTypeWideColumnEntity) {
+    if (Status s = WideColumnSerialization::ForEachBlobFileNumber(
+            value, update_oldest_blob);
+        !s.ok()) {
+      return s;
     }
   }
 
@@ -347,6 +361,10 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint32(dst, NewFileCustomTag::kMaxTimestamp);
     PutLengthPrefixedSlice(dst, Slice(f.max_timestamp));
   }
+  if (!f.file_open_metadata.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kFileOpenMetadata);
+    PutLengthPrefixedSlice(dst, Slice(f.file_open_metadata));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -491,6 +509,9 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
           break;
         case kMaxTimestamp:
           f.max_timestamp = field.ToString();
+          break;
+        case kFileOpenMetadata:
+          f.file_open_metadata = field.ToString();
           break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
@@ -984,6 +1005,10 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     AppendNumberTo(&r, f.tail_size);
     r.append(" User-defined timestamps persisted: ");
     r.append(f.user_defined_timestamps_persisted ? "true" : "false");
+    if (!f.file_open_metadata.empty()) {
+      r.append(" file_open_metadata_size: ");
+      AppendNumberTo(&r, f.file_open_metadata.size());
+    }
   }
 
   for (const auto& blob_file_addition : blob_file_additions_) {
@@ -1106,6 +1131,9 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       jw << "TailSize" << f.tail_size;
       jw << "UserDefinedTimestampsPersisted"
          << f.user_defined_timestamps_persisted;
+      if (!f.file_open_metadata.empty()) {
+        jw << "FileOpenMetadataSize" << f.file_open_metadata.size();
+      }
       jw.EndArrayedObject();
     }
 

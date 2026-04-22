@@ -11,7 +11,9 @@
 
 #include <limits>
 #include <string>
+#include <vector>
 
+#include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/blob/blob_index.h"
 #include "db/dbformat.h"
@@ -24,6 +26,7 @@
 #include "logging/logging.h"
 #include "memory/arena.h"
 #include "monitoring/perf_context_imp.h"
+#include "port/likely.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_dispatcher.h"
 #include "rocksdb/iterator.h"
@@ -39,6 +42,26 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+
+bool HasFullTimestampVisibility(const ReadOptions& read_options) {
+  if (read_options.iter_start_ts != nullptr) {
+    return false;
+  }
+  if (read_options.timestamp == nullptr) {
+    return true;
+  }
+  const Slice ts = *read_options.timestamp;
+  for (size_t i = 0; i < ts.size(); ++i) {
+    if (static_cast<unsigned char>(ts[i]) != 0xff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 DBIter::DBIter(Env* _env, const ReadOptions& read_options,
                const ImmutableOptions& ioptions,
                const MutableCFOptions& mutable_cf_options,
@@ -53,12 +76,14 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       user_comparator_(cmp),
       merge_operator_(ioptions.merge_operator.get()),
       iter_(iter),
-      blob_reader_(version, read_options.read_tier,
-                   read_options.verify_checksums, read_options.fill_cache,
-                   read_options.io_activity,
-                   cfh ? cfh->cfd()->blob_file_cache() : nullptr),
+      blob_reader_(
+          version, read_options.read_tier, read_options.verify_checksums,
+          read_options.fill_cache, read_options.io_activity,
+          cfh ? cfh->cfd()->blob_file_cache() : nullptr,
+          cfh != nullptr && cfh->cfd()->blob_partition_manager() != nullptr),
       read_callback_(read_callback),
       sequence_(s),
+      value_columns_state_(version, read_options, cfh),
       statistics_(ioptions.stats),
       max_skip_(mutable_cf_options.max_sequential_skip_in_iterations),
       max_skippable_internal_keys_(read_options.max_skippable_internal_keys),
@@ -75,12 +100,6 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       avg_op_scan_flush_trigger_(0),
       iter_step_since_seek_(1),
       mem_hidden_op_scanned_since_seek_(0),
-      // Read-path range conversion assumes the scan can observe all interior
-      // live keys. table_filter can hide whole SSTs and break that invariant.
-      min_tombstones_for_range_conversion_(
-          active_mem != nullptr && !read_options.table_filter
-              ? mutable_cf_options.min_tombstones_for_range_conversion
-              : 0),
       contiguous_tombstone_count_(0),
       direction_(kForward),
       valid_(false),
@@ -92,6 +111,18 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       expect_total_order_inner_iter_(prefix_extractor_ == nullptr ||
                                      read_options.total_order_seek ||
                                      read_options.auto_prefix_mode),
+      // Read-path range conversion assumes the scan can observe all interior
+      // live keys. table_filter can hide whole SSTs, and timestamp filtering
+      // can hide newer UDT versions unless the read is at max timestamp with no
+      // lower timestamp bound. Legacy prefix iterators without
+      // prefix_same_as_start do not guarantee complete scans, so conversion
+      // must stay disabled for the iterator lifetime.
+      min_tombstones_for_range_conversion_(
+          active_mem != nullptr && !read_options.table_filter &&
+                  (expect_total_order_inner_iter_ || prefix_same_as_start_) &&
+                  HasFullTimestampVisibility(read_options)
+              ? mutable_cf_options.min_tombstones_for_range_conversion
+              : 0),
       expose_blob_index_(expose_blob_index),
       allow_unprepared_value_(read_options.allow_unprepared_value),
       is_blob_(false),
@@ -147,7 +178,7 @@ Status DBIter::GetProperty(std::string prop_name, std::string* prop) {
   } else if (prop_name == "rocksdb.iterator.is-value-pinned") {
     if (valid_) {
       *prop = (pin_thru_lifetime_ && iter_.Valid() &&
-               iter_.value().data() == value_.data())
+               iter_.value().data() == value_columns_state_.value().data())
                   ? "1"
                   : "0";
     } else {
@@ -257,7 +288,17 @@ Status DBIter::BlobReader::RetrieveAndSetBlobValue(
 
   return BlobFilePartitionManager::ResolveBlobDirectWriteIndex(
       read_options, user_key, blob_idx, version_, blob_file_cache_,
-      &blob_value_);
+      prefetch_buffer, &blob_value_, bytes_read);
+}
+
+BlobFetcher DBIter::BlobReader::CreateBlobFetcher() const {
+  ReadOptions read_options;
+  read_options.read_tier = read_tier_;
+  read_options.verify_checksums = verify_checksums_;
+  read_options.fill_cache = fill_cache_;
+  read_options.io_activity = io_activity_;
+  return BlobFetcher(version_, read_options, blob_file_cache_,
+                     allow_write_path_fallback_);
 }
 
 bool DBIter::SetValueAndColumnsFromBlobImpl(const Slice& user_key,
@@ -292,8 +333,8 @@ bool DBIter::SetValueAndColumnsFromBlob(const Slice& user_key,
   }
 
   if (allow_unprepared_value_) {
-    assert(value_.empty());
-    assert(wide_columns_.empty());
+    assert(value_columns_state_.value().empty());
+    assert(value_columns_state_.wide_columns().empty());
 
     assert(lazy_blob_index_.empty());
     lazy_blob_index_ = blob_index;
@@ -305,22 +346,102 @@ bool DBIter::SetValueAndColumnsFromBlob(const Slice& user_key,
 }
 
 bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
-  assert(value_.empty());
-  assert(wide_columns_.empty());
+  auto& state = value_columns_state_;
+  state.AssertReadyForEntity();
 
-  const Status s = WideColumnSerialization::Deserialize(slice, wide_columns_);
+  // Fast path: if no blob columns, use the simpler Deserialize
+  bool has_blob_columns = false;
+  {
+    const Status s_hbc =
+        WideColumnSerialization::HasBlobColumns(slice, has_blob_columns);
+    if (!s_hbc.ok()) {
+      status_ = s_hbc;
+      valid_ = false;
+      return false;
+    }
+  }
+  if (LIKELY(!has_blob_columns)) {
+    WideColumns& wide_columns = state.wide_columns();
+    const Status s = WideColumnSerialization::Deserialize(slice, wide_columns);
 
-  if (!s.ok()) {
-    status_ = s;
-    valid_ = false;
-    wide_columns_.clear();
+    if (!s.ok()) {
+      status_ = s;
+      valid_ = false;
+      state.ClearWideColumns();
+      return false;
+    }
+
+    state.MaybeSetValueFromMaterializedDefaultColumn();
+    return true;
+  }
+
+  // Entity has blob columns.
+  // First, copy the serialized data to the saved entity buffer so that column
+  // name/value Slices remain valid after the internal iterator moves.
+  // Guard: if slice already aliases that saved buffer (e.g., when called from
+  // SetValueAndColumnsFromMergeResult), skip the redundant copy to
+  // avoid self-aliased std::string::assign (undefined behavior).
+  state.SaveEntitySliceIfNeeded(slice);
+
+  {
+    Slice input_copy = state.PrepareForLazyEntityDeserialize();
+    const Status s = WideColumnSerialization::DeserializeV2(
+        input_copy, state.lazy_entity_columns(), state.lazy_blob_columns());
+
+    if (!s.ok()) {
+      status_ = s;
+      valid_ = false;
+      state.ClearLazyEntity();
+      return false;
+    }
+  }
+
+  // Iterator positions must expose fully prepared values and columns once
+  // Valid() becomes true, so resolve and materialize all blob columns here.
+  state.BindLazyEntity(saved_key_.GetUserKey());
+  if (!MaterializeLazyEntityColumns()) {
+    state.ClearLazyEntity();
     return false;
   }
+  state.MaybeSetValueFromMaterializedDefaultColumn();
 
-  if (WideColumnsHelper::HasDefaultColumn(wide_columns_)) {
-    value_ = WideColumnsHelper::GetDefaultColumn(wide_columns_);
+  return true;
+}
+
+bool DBIter::MaterializeLazyEntityColumns() const {
+  const auto& state = value_columns_state_;
+  if (state.lazy_entity_columns().empty() || !state.wide_columns().empty()) {
+    return true;
   }
 
+  std::lock_guard<std::mutex> lock(state.lazy_entity_columns_mutex());
+  if (state.lazy_entity_columns().empty() || !state.wide_columns().empty()) {
+    return true;
+  }
+
+  DBIter* const mutable_this = const_cast<DBIter*>(this);
+  auto& mutable_state = mutable_this->value_columns_state_;
+  WideColumns materialized_columns;
+  materialized_columns.reserve(state.lazy_entity_columns().size());
+  for (const auto& col : state.lazy_entity_columns()) {
+    materialized_columns.emplace_back(col.name(), col.value());
+  }
+
+  for (const auto& blob_col : state.lazy_blob_columns()) {
+    Slice resolved_value;
+    const Status s = mutable_state.entity_blob_resolver().ResolveColumn(
+        blob_col.first, &resolved_value);
+    if (!s.ok()) {
+      mutable_this->status_ = s;
+      mutable_this->valid_ = false;
+      mutable_state.wide_columns().clear();
+      return false;
+    }
+
+    materialized_columns[blob_col.first].value() = resolved_value;
+  }
+
+  mutable_state.wide_columns() = std::move(materialized_columns);
   return true;
 }
 
@@ -333,7 +454,7 @@ bool DBIter::SetValueAndColumnsFromMergeResult(const Status& merge_status,
   }
 
   if (result_type == kTypeWideColumnEntity) {
-    if (!SetValueAndColumnsFromEntity(saved_value_)) {
+    if (!SetValueAndColumnsFromEntity(value_columns_state_.saved_value())) {
       assert(!valid_);
       return false;
     }
@@ -343,8 +464,9 @@ bool DBIter::SetValueAndColumnsFromMergeResult(const Status& merge_status,
   }
 
   assert(result_type == kTypeValue);
-  SetValueAndColumnsFromPlain(pinned_value_.data() ? pinned_value_
-                                                   : saved_value_);
+  SetValueAndColumnsFromPlain(pinned_value_.data()
+                                  ? pinned_value_
+                                  : value_columns_state_.saved_value());
   valid_ = true;
   return true;
 }
@@ -371,7 +493,7 @@ bool DBIter::PrepareValue() {
 // POST: saved_key_ should have the next user key if valid_,
 //       if the current entry is a result of merge
 //           current_entry_is_merged_ => true
-//           saved_value_             => the merged value
+//           the saved merge buffer   => the merged value
 //
 // NOTE: In between, saved_key_ can point to a user key that has
 //       a delete marker or a sequence number higher than sequence_
@@ -683,7 +805,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
 // PRE: iter_.key() points to the first merge type entry
 //      saved_key_ stores the user key
 //      iter_.PrepareValue() has been called
-// POST: saved_value_ has the merged value for the user key
+// POST: the saved merge buffer has the merged value for the user key
 //       iter_ points to the next entry (or invalid)
 bool DBIter::MergeValuesNewToOld() {
   if (!merge_operator_) {
@@ -733,7 +855,7 @@ bool DBIter::MergeValuesNewToOld() {
         value = ParsePackedValueForValue(value);
       }
       // hit a put or put equivalent, merge the put value with operands and
-      // store the final result in saved_value_. We are done!
+      // store the final result in the saved merge buffer. We are done!
       if (!MergeWithPlainBaseValue(value, ikey.user_key)) {
         return false;
       }
@@ -1470,7 +1592,7 @@ bool DBIter::MergeWithNoBaseValue(const Slice& user_key) {
       merge_operator_, user_key, MergeHelper::kNoBaseValue,
       merge_context_.GetOperands(), logger_, statistics_, clock_,
       /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
-      &saved_value_, &pinned_value_, &result_type);
+      &value_columns_state_.saved_value(), &pinned_value_, &result_type);
   return SetValueAndColumnsFromMergeResult(s, result_type);
 }
 
@@ -1483,7 +1605,7 @@ bool DBIter::MergeWithPlainBaseValue(const Slice& value,
       merge_operator_, user_key, MergeHelper::kPlainBaseValue, value,
       merge_context_.GetOperands(), logger_, statistics_, clock_,
       /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
-      &saved_value_, &pinned_value_, &result_type);
+      &value_columns_state_.saved_value(), &pinned_value_, &result_type);
   return SetValueAndColumnsFromMergeResult(s, result_type);
 }
 
@@ -1521,14 +1643,28 @@ bool DBIter::MergeWithBlobBaseValue(const Slice& blob_index,
 
 bool DBIter::MergeWithWideColumnBaseValue(const Slice& entity,
                                           const Slice& user_key) {
+  // Resolve V2 entity blob columns if present, since TimedFullMerge only
+  // supports V1 format.
+  BlobFetcher blob_fetcher = blob_reader_.CreateBlobFetcher();
+  std::string resolved_entity;
+  Slice effective_entity;
+  Status s_resolve = WideColumnSerialization::ResolveEntityForMerge(
+      entity, user_key, &blob_fetcher, nullptr /* prefetch_buffers */,
+      resolved_entity, effective_entity);
+  if (!s_resolve.ok()) {
+    status_ = std::move(s_resolve);
+    valid_ = false;
+    return false;
+  }
+
   // `op_failure_scope` (an output parameter) is not provided (set to nullptr)
   // since a failure must be propagated regardless of its value.
   ValueType result_type;
-  const Status s = MergeHelper::TimedFullMerge(
-      merge_operator_, user_key, MergeHelper::kWideBaseValue, entity,
+  Status s = MergeHelper::TimedFullMerge(
+      merge_operator_, user_key, MergeHelper::kWideBaseValue, effective_entity,
       merge_context_.GetOperands(), logger_, statistics_, clock_,
       /* update_num_ops_stats */ true, /* op_failure_scope */ nullptr,
-      &saved_value_, &pinned_value_, &result_type);
+      &value_columns_state_.saved_value(), &pinned_value_, &result_type);
   return SetValueAndColumnsFromMergeResult(s, result_type);
 }
 
@@ -1939,7 +2075,6 @@ void DBIter::Seek(const Slice& target) {
   if (ShouldSetPrefix(target)) {
     prefix_.emplace();
     prefix_->SetUserKey(prefix_extractor_->Transform(target));
-  } else {
   }
   FindNextUserEntry(false /* not skipping saved_key */);
   if (!valid_) {

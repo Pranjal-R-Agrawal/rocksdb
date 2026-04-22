@@ -1781,6 +1781,14 @@ struct DBOptions {
   // Default: Enabled in kCompactionStyleLevel mode.
   CompactionStyleSet calculate_sst_write_lifetime_hint_set = {
       CompactionStyle::kCompactionStyleLevel};
+
+  // EXPERIMENTAL
+  // When this is true, save file system metadata (if supported by the FS) for
+  // SST files added to the DB in the MANIFEST, and use it to accelerate
+  // re-opening of those files on DB open. This will help cut down DB open
+  // latency on remote storage systems.
+  bool fast_sst_open = false;
+
   // End EXPERIMENTAL
 };
 
@@ -2233,6 +2241,19 @@ struct ReadOptions {
   // properties of each table during iteration. If the callback returns false,
   // the table will not be scanned. This option only affects Iterators and has
   // no impact on point lookups.
+  //
+  // Iterator creation on read-write DB variants returns InvalidArgument for
+  // safety when the target column family's min_tombstones_for_range_conversion
+  // is non-zero. The reasoning is that a fully visible iterator may create a
+  // range tombstone from tombstones that can be later converted to a range
+  // tombstone. If another iterator tries to filter out the table with the
+  // tombstones, the reader would expect the deletes to no longer apply, but it
+  // actually still does because of the range tombstone that was inserted.
+  // IMPORTANT: min_tombstones_for_range_conversion is a dynamic option, so
+  // disabling it may allow you to use table_filters again, you must account for
+  // the possibility that range tombstones have already been inserted into
+  // either the memtable or other sst files.
+  //
   // Default: empty (every table will be scanned)
   std::function<bool(const TableProperties&)> table_filter;
 
@@ -2304,9 +2325,17 @@ struct ReadOptions {
   // block based table index. The table_factory used for the column family
   // must support building/reading this index.
   //
-  // All iterator operations are supported: forward scans (SeekToFirst, Seek,
-  // Next), reverse scans (SeekToLast, SeekForPrev, Prev), and point lookups
-  // (Get). Leave this null to use the native block-based table index.
+  // The UDI framework supports all iterator operations: forward scans
+  // (SeekToFirst, Seek, Next), reverse scans (SeekToLast, SeekForPrev, Prev),
+  // and point lookups (Get). Concrete UDI implementations may impose their
+  // own restrictions -- check the specific implementation's documentation.
+  //
+  // When BlockBasedTableOptions::use_udi_as_primary_index is true, this field
+  // does not need to be set -- all reads automatically use the UDI. If set
+  // while use_udi_as_primary_index is true, the UDI from
+  // BlockBasedTableOptions takes precedence. This field is only needed when
+  // the UDI is a secondary index and you want to explicitly select it for
+  // reads.
   const UserDefinedIndexFactory* table_index_factory = nullptr;
 
   // *** END options only relevant to iterators or scans ***

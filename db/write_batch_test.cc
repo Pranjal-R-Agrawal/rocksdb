@@ -10,12 +10,15 @@
 #include <memory>
 #include <unordered_map>
 
+#include "db/blob/blob_index.h"
 #include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/memtable.h"
+#include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
 #include "db/write_batch_internal.h"
 #include "dbformat.h"
+#include "port/mmap.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -730,6 +733,54 @@ TEST_F(WriteBatchTest, DISABLED_LargeKeyValue) {
   ASSERT_EQ(2, handler.num_seen);
 }
 
+// Uses anonymous mmap (lazy-zeroed) so the large data itself doesn't consume
+// physical memory -- only the destination copy does (~4GB peak during the
+// acceptance case where batch.Put copies into batch.rep_).
+TEST_F(WriteBatchTest, LargeKeyValueSizeLimit) {
+  if (!test::HasBigMem()) {
+    ROCKSDB_GTEST_BYPASS("insufficient memory for reliable continuous testing");
+    return;
+  }
+
+  constexpr size_t kMaxKeySize =
+      size_t{std::numeric_limits<uint32_t>::max()} - 8;
+  constexpr size_t kMaxValueSize = size_t{std::numeric_limits<uint32_t>::max()};
+
+  WriteBatch batch;
+
+  // --- Large key ---
+  {
+    MemMapping mm = MemMapping::AllocateLazyZeroed(kMaxKeySize + 1);
+    ASSERT_NE(nullptr, mm.Get());
+
+    // A key at the limit should be accepted
+    ASSERT_OK(batch.Put(Slice(mm.AsSlice().data(), kMaxKeySize), "val"));
+    batch.Clear();
+
+    // A key one byte over the limit should be rejected
+    ASSERT_TRUE(batch.Put(mm.AsSlice(), "val").IsInvalidArgument());
+    ASSERT_TRUE(batch.Merge(mm.AsSlice(), "val").IsInvalidArgument());
+    ASSERT_TRUE(batch.Delete(mm.AsSlice()).IsInvalidArgument());
+    ASSERT_TRUE(batch.SingleDelete(mm.AsSlice()).IsInvalidArgument());
+    ASSERT_TRUE(
+        batch.DeleteRange(mm.AsSlice(), mm.AsSlice()).IsInvalidArgument());
+  }
+
+  // --- Large value ---
+  {
+    MemMapping mm = MemMapping::AllocateLazyZeroed(kMaxValueSize + 1);
+    ASSERT_NE(nullptr, mm.Get());
+
+    // A value at the limit should be accepted
+    ASSERT_OK(batch.Put("key", Slice(mm.AsSlice().data(), kMaxValueSize)));
+    batch.Clear();
+
+    // A value one byte over the limit should be rejected
+    ASSERT_TRUE(batch.Put("key", mm.AsSlice()).IsInvalidArgument());
+    ASSERT_TRUE(batch.Merge("key", mm.AsSlice()).IsInvalidArgument());
+  }
+}
+
 TEST_F(WriteBatchTest, Continue) {
   WriteBatch batch;
 
@@ -899,6 +950,43 @@ TEST_F(WriteBatchTest, AttributeGroupSavePointTest) {
       "PutEntity(foo, 0_c_1_n:0_c_1_v 0_c_2_n:0_c_2_v)"
       "PutEntityCF(2, foo, 2_c_1_n:2_c_1_v 2_c_2_n:2_c_2_v)",
       handler.seen);
+}
+
+TEST_F(WriteBatchTest, IterateCanRebuildSerializedV2Entity) {
+  WriteBatch batch;
+
+  BlobIndex blob_index;
+  std::string encoded_blob_index;
+  BlobIndex::EncodeBlob(&encoded_blob_index, 9 /* file_number */,
+                        123 /* offset */, 456 /* size */, kNoCompression);
+  ASSERT_OK(blob_index.DecodeFrom(encoded_blob_index));
+
+  const std::vector<std::pair<std::string, std::string>> columns = {
+      {"", "default_inline"},
+      {"ttl", "00000001"},
+  };
+  std::string serialized_entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(columns, {{0, blob_index}},
+                                                 serialized_entity));
+  ASSERT_OK(WriteBatchInternal::PutEntitySerialized(&batch, 7 /* cf_id */,
+                                                    "key", serialized_entity));
+
+  struct RebuildHandler : public WriteBatch::Handler {
+    WriteBatch rebuilt;
+
+    Status PutCF(uint32_t cf, const Slice& key, const Slice& value) override {
+      return WriteBatchInternal::Put(&rebuilt, cf, key, value);
+    }
+
+    Status PutEntityCF(uint32_t cf, const Slice& key,
+                       const Slice& entity) override {
+      return WriteBatchInternal::PutEntitySerialized(&rebuilt, cf, key, entity);
+    }
+  } handler;
+
+  ASSERT_OK(batch.Iterate(&handler));
+  ASSERT_EQ(handler.rebuilt.Count(), batch.Count());
+  ASSERT_EQ(handler.rebuilt.Data(), batch.Data());
 }
 
 TEST_F(WriteBatchTest, ColumnFamiliesBatchTest) {

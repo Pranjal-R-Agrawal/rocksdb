@@ -93,6 +93,10 @@ int db_stress_tool(int argc, char** argv) {
     FaultInjectionTestFS* fs =
         new FaultInjectionTestFS(raw_env->GetFileSystem());
     fault_fs_guard.reset(fs);
+    // Info logs are debugging artifacts, so exclude them from fault injection
+    // and keep error accounting focused on DB data and metadata.
+    fault_fs_guard->SetFileTypesExcludedFromFaultInjection(
+        {FileType::kInfoLogFile});
     // Set it to direct writable here to initially bypass any fault injection
     // during DB open This will correspondingly be overwritten in
     // StressTest::Open() for open fault injection and in RunStressTestImpl()
@@ -222,11 +226,12 @@ int db_stress_tool(int argc, char** argv) {
     exit(1);
   }
   if (FLAGS_enable_blob_direct_write) {
-    // Blob direct write is intentionally validated as a reduced-scope v1
-    // feature. We allow the WAL-disabled crash-test profile, but reject
-    // best-efforts recovery, parallel memtable/write-queue variants,
-    // transactions, remote compaction, and APIs/features that depend on
-    // active-file snapshotting or unsupported blob option transitions.
+    // Blob direct write is intentionally validated as a reduced-scope stress
+    // feature. We allow the WAL-disabled crash-test profile, including
+    // wide-column PutEntity/GetEntity coverage, but reject best-efforts
+    // recovery, parallel memtable/write-queue variants, transactions, remote
+    // compaction, and APIs/features that depend on active-file snapshotting or
+    // unsupported blob option transitions.
     if (!FLAGS_enable_blob_files) {
       return ReturnFlagValidationError(
           "enable_blob_direct_write requires enable_blob_files");

@@ -1240,6 +1240,10 @@ struct AdvancedColumnFamilyOptions {
 
   // Custom partition strategy for blob direct writes.
   // If null, uses the default round-robin strategy.
+  // Put()/Merge-style value separation uses SelectPartition(..., Slice value),
+  // while PutEntity() wide-column separation calls
+  // SelectPartition(..., WideColumns columns) once per entity and reuses the
+  // selected partition for all blob-backed columns in that entity.
   // Requires enable_blob_direct_write = true.
   //
   // RocksDB treats this as an application-supplied callback rather than a
@@ -1406,6 +1410,21 @@ struct AdvancedColumnFamilyOptions {
   // the current mutable memtable (only if memtable is not empty). This is a
   // logically redundant entry that does not change any data, but optimizes
   // future iterators by potentially skipping a large number of tombstone scans.
+  //
+  // This optimization is best-effort and is currently disabled for iterator
+  // configurations that may not expose all interior live keys, including:
+  // * user-defined timestamp reads without full visibility (for example,
+  //   ReadOptions::iter_start_ts or a non-max ReadOptions::timestamp)
+  // * prefix extractor reads that are neither total-order
+  //   (ReadOptions::total_order_seek / ReadOptions::auto_prefix_mode) nor
+  //   bounded by ReadOptions::prefix_same_as_start
+  //
+  // It also requires an active mutable memtable, and insertion is skipped when
+  // that memtable is empty.
+  //
+  // Read-write iterators using ReadOptions::table_filter are rejected while
+  // this option is enabled, see more details in ReadOptions::table_filter
+  // comments.
   //
   // Set to 0 to disable.
   //

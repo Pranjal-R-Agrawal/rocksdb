@@ -105,3 +105,8 @@ third-party/folly/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+tools/__pycache__/
+# Keep documentation trackable even if broader ignores match names like "*_test".
+!docs/
+!docs/**
