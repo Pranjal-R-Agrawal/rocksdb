@@ -4,8 +4,9 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
 import sys
+import argparse
 
-EXPECTED_FIELD_COUNT = 4
+EXPECTED_FIELD_COUNT = 3
 
 def timestamp_tag():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -19,11 +20,11 @@ def build_rocksdb(source_dir: Path, build_dir: Path):
 def build_benchmarker(source_dir: Path, build_dir: Path):
     print("🛠 Compiling benchmark tool...")
     build_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["cmake", "-S", str(source_dir), "-B", str(build_dir)], check=True)
+    subprocess.run(["cmake", "-S", str(source_dir), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"], check=True)
     subprocess.run(["cmake", "--build", str(build_dir)], check=True)
 
-def run_exp(bench_path: Path, n, table_mode, bench_mode, d_dist, a_dist):
-    cmd = [str(bench_path), str(n), table_mode, bench_mode, d_dist, a_dist]
+def run_exp(bench_path: Path, n, table_mode, bench_mode, d_dist, a_dist, duration_sec):
+    cmd = [str(bench_path), str(n), table_mode, bench_mode, d_dist, a_dist, str(duration_sec)]
     raw = subprocess.check_output(cmd).decode().strip()
 
     parts = [p.strip() for p in raw.split(",")]
@@ -32,7 +33,7 @@ def run_exp(bench_path: Path, n, table_mode, bench_mode, d_dist, a_dist):
             f"Unexpected benchmark output ({len(parts)} fields, expected {EXPECTED_FIELD_COUNT}): {raw}"
         )
 
-    size, avg, p99, b_time = map(float, parts)
+    size, avg, b_time = map(float, parts)
     return {
         "Keys": n,
         "TableMode": table_mode,
@@ -41,7 +42,6 @@ def run_exp(bench_path: Path, n, table_mode, bench_mode, d_dist, a_dist):
         "AccessPattern": a_dist,
         "SizeKB": size,
         "AvgLatUs": avg,
-        "P99Us": p99,
         "BuildTimeSec": b_time,
         "Combo": f"Data={d_dist}, Access={a_dist}",
     }
@@ -59,67 +59,75 @@ def print_progress(done_keys: int, total_keys: int, label: str = ""):
     sys.stdout.flush()
 
 def main():
-    ts = timestamp_tag()
-
-    source_dir = Path(__file__).resolve().parent.parent
-    build_dir = source_dir / "build"
-    build_rocksdb(source_dir, build_dir)
+    parser = argparse.ArgumentParser(description="Run or plot RocksDB benchmarks")
+    parser.add_argument("--csv", type=str, help="Path to existing CSV to skip benchmarking and just plot")
+    parser.add_argument("--duration", type=float, default=1.0, help="Duration in seconds for each read benchmark")
+    args = parser.parse_args()
 
     source_dir = Path(__file__).resolve().parent
-    build_dir = source_dir / "build"
-    build_benchmarker(source_dir, build_dir)
 
-    raw_dir = source_dir / "raw_data" / ts
-    graphs_dir = source_dir / "graphs" / ts
+    if args.csv:
+        csv_path = Path(args.csv).resolve()
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Provided CSV not found: {csv_path}")
+        print(f"Loading results from {csv_path}...")
+        df = pd.read_csv(csv_path)
+        results_dir = csv_path.parent
+    else:
+        ts = timestamp_tag()
+        rocksdb_source_dir = source_dir.parent
+        rocksdb_build_dir = rocksdb_source_dir / "build"
+        build_rocksdb(rocksdb_source_dir, rocksdb_build_dir)
 
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    graphs_dir.mkdir(parents=True, exist_ok=True)
+        build_dir = source_dir / "build"
+        build_benchmarker(source_dir, build_dir)
 
-    bench_path = build_dir / "bench"
-    if not bench_path.exists():
-        raise FileNotFoundError(f"Benchmark binary not found: {bench_path}")
+        results_dir = source_dir / "results" / ts
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-    n_values = [
-        12345, 17891, 24567, 33321,
-        45678, 61234, 78901, 104729,
-        137913, 181337, 238901, 314159,
-        412667, 543219, # 716543, 943717,
-    ]
+        bench_path = build_dir / "bench"
+        if not bench_path.exists():
+            raise FileNotFoundError(f"Benchmark binary not found: {bench_path}")
 
-    table_modes = ["block", "cuckoo"]
-    bench_modes = ["no_compact", "compact"]
-    data_dists = ["uniform", "zipf", "normal"]
-    access_dists = ["uniform", "zipf", "normal"]
+        n_values = [
+            12345, 17891, 24567, 33321,
+            45678, 61234, 78901, 104729,
+            137913, 181337, 238901, 314159,
+            412667, 543219, 716543, 943717,
+        ]
 
-    total_keys = (
-        len(table_modes)
-        * len(bench_modes)
-        * len(data_dists)
-        * len(access_dists)
-        * sum(n_values)
-    )
-    done_keys = 0
+        table_modes = ["block", "cuckoo"]
+        bench_modes = ["no_compact", "compact"]
+        data_dists = ["uniform", "zipf"]
+        access_dists = ["uniform", "zipf"]
 
-    raw_results = []
+        total_keys = (
+            len(table_modes)
+            * len(bench_modes)
+            * len(data_dists)
+            * len(access_dists)
+            * sum(n_values)
+        )
+        done_keys = 0
+        raw_results = []
 
-    for n in n_values:
-        for d_dist in data_dists:
-            for a_dist in access_dists:
-                for table_mode in table_modes:
-                    for bench_mode in bench_modes:
-                        label = f"{table_mode} | {bench_mode} | Data:{d_dist} | Access:{a_dist} | N:{n}"
-                        print_progress(done_keys, total_keys, label=label)
-                        raw_results.append(
-                            run_exp(bench_path, n, table_mode, bench_mode, d_dist, a_dist)
-                        )
-                        done_keys += n
-                        print_progress(done_keys, total_keys, label=label)
+        for n in n_values:
+            for d_dist in data_dists:
+                for a_dist in access_dists:
+                    for table_mode in table_modes:
+                        for bench_mode in bench_modes:
+                            label = f"{table_mode} | {bench_mode} | Data:{d_dist} | Access:{a_dist} | N:{n}"
+                            print_progress(done_keys, total_keys, label=label)
+                            raw_results.append(
+                                run_exp(bench_path, n, table_mode, bench_mode, d_dist, a_dist, args.duration)
+                            )
+                            done_keys += n
+                            print_progress(done_keys, total_keys, label=label)
 
-    sys.stdout.write("\n")
-
-    df = pd.DataFrame(raw_results)
-    csv_path = raw_dir / "final_bench_results.csv"
-    df.to_csv(csv_path, index=False)
+        sys.stdout.write("\n")
+        df = pd.DataFrame(raw_results)
+        csv_path = results_dir / "final_bench_results.csv"
+        df.to_csv(csv_path, index=False)
 
     build_df = df.groupby(["Keys", "TableMode", "BenchMode", "DataDist"]).agg({
         "BuildTimeSec": "mean",
@@ -150,42 +158,16 @@ def main():
     axes1[0].set_ylabel("Seconds")
     axes1[1].set_ylabel("KB")
     plt.tight_layout()
-    plt.savefig(graphs_dir / "metrics_build_and_size.png")
+    plt.savefig(results_dir / "metrics_build_and_size.png")
     plt.close(fig1)
 
-    fig_lat = plt.figure(figsize=(10, 7))
-    for table_mode in ["block", "cuckoo"]:
-        for bench_mode in ["no_compact", "compact"]:
-            m_df = df[(df["TableMode"] == table_mode) & (df["BenchMode"] == bench_mode)]
-            for combo in m_df["Combo"].unique():
-                c_df = m_df[m_df["Combo"] == combo]
-                ls = "-" if bench_mode == "compact" else "--"
-                plt.plot(
-                    c_df["Keys"],
-                    c_df["AvgLatUs"],
-                    label=f"{table_mode} {bench_mode} {combo}",
-                    linestyle=ls,
-                    marker="v",
-                )
-
-    plt.title("Combined Average Latency Comparison")
-    plt.xlabel("Number of Keys")
-    plt.ylabel("Latency (us)")
-    plt.xscale("log", base=10)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", ncol=1)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(graphs_dir / "latency_combined.png")
-    plt.close(fig_lat)
-
-    fig2, axes2 = plt.subplots(3, 3, figsize=(18, 16))
+    fig2, axes2 = plt.subplots(2, 2, figsize=(12, 10))
     combos = [
-        ("uniform", "uniform"), ("uniform", "zipf"), ("uniform", "normal"),
-        ("zipf", "uniform"), ("zipf", "zipf"), ("zipf", "normal"),
-        ("normal", "uniform"), ("normal", "zipf"), ("normal", "normal"),
+        ("uniform", "uniform"), ("uniform", "zipf"),
+        ("zipf", "uniform"), ("zipf", "zipf"),
     ]
 
-    for (d_dist, a_dist), (r, c) in zip(combos, [(i, j) for i in range(3) for j in range(3)]):
+    for (d_dist, a_dist), (r, c) in zip(combos, [(0, 0), (0, 1), (1, 0), (1, 1)]):
         ax = axes2[r, c]
         for table_mode in ["block", "cuckoo"]:
             for bench_mode in ["no_compact", "compact"]:
@@ -210,14 +192,13 @@ def main():
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(graphs_dir / "latency_individual_combos.png")
+    plt.savefig(results_dir / "latency_individual_combos.png")
     plt.close(fig2)
 
     print("\n✅ Success! Generated:")
     print(f" - {csv_path}")
-    print(f" - {graphs_dir / 'metrics_build_and_size.png'}")
-    print(f" - {graphs_dir / 'latency_combined.png'}")
-    print(f" - {graphs_dir / 'latency_individual_combos.png'}")
+    print(f" - {results_dir / 'metrics_build_and_size.png'}")
+    print(f" - {results_dir / 'latency_individual_combos.png'}")
 
 if __name__ == "__main__":
     main()
